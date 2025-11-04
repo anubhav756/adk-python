@@ -700,6 +700,7 @@ def to_agent_engine(
       `agent_folder` will be used.
   """
   app_name = os.path.basename(agent_folder)
+  display_name = display_name or app_name
   parent_folder = os.path.dirname(agent_folder)
   if parent_folder != os.getcwd():
     click.echo(f'Please deploy from the project dir: {parent_folder}')
