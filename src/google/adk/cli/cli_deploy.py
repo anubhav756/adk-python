@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 import shutil
@@ -74,12 +75,14 @@ if {is_config_agent}:
     # This path is used to support the file structure in Agent Engine.
     root_agent = config_agent_utils.from_config("./{temp_folder}/{app_name}/root_agent.yaml")
 else:
-  from {app_name}.agent import {adk_app_object}
+  from .agent import {adk_app_object}
 
-adk_app = AdkApp(
-  {adk_app_type}={adk_app_object},
-  enable_tracing={trace_to_cloud_option},
-)
+if {express_mode}: # Whether or not to use Express Mode
+  import os
+  import vertexai
+  vertexai.init(api_key=os.environ.get("GOOGLE_API_KEY"))
+
+adk_app = AdkApp({adk_app_type}={adk_app_object})
 """
 
 _AGENT_ENGINE_CLASS_METHODS = [
@@ -621,10 +624,10 @@ def to_cloud_run(
 def to_agent_engine(
     *,
     agent_folder: str,
-    temp_folder: str,
+    temp_folder: Optional[str] = None,
     adk_app: str,
     staging_bucket: str,
-    trace_to_cloud: bool,
+    trace_to_cloud: Optional[bool] = None,
     express_mode_api_key: Optional[str] = None,
     adk_app_object: Optional[str] = None,
     agent_engine_id: Optional[str] = None,
@@ -656,7 +659,6 @@ def to_agent_engine(
 
   adk_app = AdkApp(
     agent=<adk_app_object>,  # or `app=<adk_app_object>`
-    enable_tracing=True,
   )
   ```
 
@@ -673,7 +675,7 @@ def to_agent_engine(
       If not provided, the API key from the GOOGLE_API_KEY environment variable
       will be used. It will only be used if GOOGLE_GENAI_USE_VERTEXAI is true.
     adk_app_object (str): Optional. The Python object corresponding to the root
-      ADK agent or app.
+      ADK agent or app. Defaults to `root_agent` if not specified.
     agent_engine_id (str): Optional. The ID of the Agent Engine instance to
       update. If not specified, a new Agent Engine instance will be created.
     absolutize_imports (bool): Optional. Default is True. Whether to absolutize
@@ -695,7 +697,21 @@ def to_agent_engine(
       `agent_folder` will be used.
   """
   app_name = os.path.basename(agent_folder)
-  agent_src_path = os.path.join(temp_folder, app_name)
+  parent_folder = os.path.dirname(agent_folder)
+  if parent_folder != os.getcwd():
+    click.echo(f'Please deploy from the project dir: {parent_folder}')
+    return
+  tmp_app_name = app_name + '_tmp' + datetime.now().strftime('%Y%m%d_%H%M%S')
+  temp_folder = temp_folder or tmp_app_name
+  agent_src_path = os.path.join(parent_folder, temp_folder)
+  click.echo(f'Staging all files in: {agent_src_path}')
+  adk_app_object = adk_app_object or 'root_agent'
+  if adk_app_object not in ['root_agent', 'app']:
+    click.echo(
+        f'Invalid adk_app_object: {adk_app_object}. Please use "root_agent"'
+        ' or "app".'
+    )
+    return
   # remove agent_src_path if it exists
   if os.path.exists(agent_src_path):
     click.echo('Removing existing files')
@@ -713,16 +729,12 @@ def to_agent_engine(
     shutil.copytree(agent_folder, agent_src_path, ignore=ignore_patterns)
     click.echo('Copying agent source code complete.')
 
-    click.echo('Initializing Vertex AI...')
-    import sys
-
-    import vertexai
-
-    sys.path.append(temp_folder)  # To register the adk_app operations
     project = _resolve_project(project)
 
     click.echo('Resolving files and dependencies...')
     agent_config = {}
+    if staging_bucket:
+      agent_config['staging_bucket'] = staging_bucket
     if not agent_engine_config_file:
       # Attempt to read the agent engine config from .agent_engine_config.json in the dir (if any).
       agent_engine_config_file = os.path.join(
@@ -745,10 +757,6 @@ def to_agent_engine(
             f'Overriding description in agent engine config with {description}'
         )
       agent_config['description'] = description
-    if agent_config.get('extra_packages'):
-      agent_config['extra_packages'].append(temp_folder)
-    else:
-      agent_config['extra_packages'] = [temp_folder]
 
     if not requirements_file:
       # Attempt to read requirements from requirements.txt in the dir (if any).
@@ -756,19 +764,23 @@ def to_agent_engine(
       if not os.path.exists(requirements_txt_path):
         click.echo(f'Creating {requirements_txt_path}...')
         with open(requirements_txt_path, 'w', encoding='utf-8') as f:
-          f.write('google-cloud-aiplatform[adk,agent_engines]')
+          f.write(
+              'google-cloud-aiplatform[adk,agent_engines] @'
+              ' git+https://github.com/googleapis/python-aiplatform.git@main'
+          )
         click.echo(f'Created {requirements_txt_path}')
-      agent_config['requirements'] = agent_config.get(
+      agent_config['requirements_file'] = agent_config.get(
           'requirements',
           requirements_txt_path,
       )
     else:
-      if 'requirements' in agent_config:
+      if 'requirements_file' in agent_config:
         click.echo(
             'Overriding requirements in agent engine config with '
             f'{requirements_file}'
         )
-      agent_config['requirements'] = requirements_file
+      agent_config['requirements_file'] = requirements_file
+    agent_config['requirements_file'] = f'{temp_folder}/requirements.txt'
 
     env_vars = {}
     if not env_file:
@@ -811,7 +823,20 @@ def to_agent_engine(
             fg='yellow',
         )
       else:
+        env_vars['GOOGLE_GENAI_USE_VERTEXAI'] = '1'
         env_vars['GOOGLE_API_KEY'] = express_mode_api_key
+    elif os.environ.get('GOOGLE_GENAI_USE_VERTEXAI') and os.environ.get(
+        'GOOGLE_API_KEY'
+    ):
+      env_vars['GOOGLE_GENAI_USE_VERTEXAI'] = '1'
+      env_vars['GOOGLE_API_KEY'] = os.environ.get('GOOGLE_API_KEY')
+      click.echo(
+          'GOOGLE_GENAI_USE_VERTEXAI and GOOGLE_API_KEY are set in the'
+          ' environment. Using them for Express Mode.'
+      )
+    env_vars['GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY'] = (
+        'true' if trace_to_cloud else 'false'
+    )
     if env_vars:
       if 'env_vars' in agent_config:
         click.echo(
@@ -821,12 +846,14 @@ def to_agent_engine(
     # Set env_vars in agent_config to None if it is not set.
     agent_config['env_vars'] = agent_config.get('env_vars', env_vars)
 
-    client = vertexai.Client(
-        project=project,
-        location=region,
-        staging_bucket=staging_bucket,
-        api_key=express_mode_api_key,
-    )
+    import vertexai
+
+    if express_mode_api_key:
+      click.echo('Initializing Vertex AI in Express Mode with API key...')
+      client = vertexai.Client(api_key=express_mode_api_key)
+    else:
+      click.echo('Initializing Vertex AI...')
+      client = vertexai.Client(project=project, location=region)
     click.echo('Vertex AI initialized.')
 
     is_config_agent = False
@@ -842,7 +869,7 @@ def to_agent_engine(
       adk_app_type = 'app'
     else:
       click.echo(
-          'Invalid adk_app_object: {adk_app_object}. Please use "root_agent"'
+          f'Invalid adk_app_object: {adk_app_object}. Please use "root_agent"'
           ' or "app".'
       )
       return
@@ -856,38 +883,33 @@ def to_agent_engine(
               agent_folder=agent_folder,
               adk_app_object=adk_app_object,
               adk_app_type=adk_app_type,
+              express_mode=express_mode_api_key is not None,
           )
       )
     click.echo(f'Created {adk_app_file}')
     click.echo('Files and dependencies resolved')
     if absolutize_imports:
-      for root, _, files in os.walk(agent_src_path):
-        for file in files:
-          if file.endswith('.py'):
-            absolutize_imports_path = os.path.join(root, file)
-            try:
-              click.echo(
-                  f'Running `absolufy-imports {absolutize_imports_path}`'
-              )
-              subprocess.run(
-                  ['absolufy-imports', absolutize_imports_path],
-                  cwd=temp_folder,
-              )
-            except Exception as e:
-              click.echo(f'The following exception was raised: {e}')
-
+      click.echo(
+          'Agent Engine deployments have switched to source-based deployment, '
+          'so it is no longer necessary to absolutize imports.'
+      )
     click.echo('Deploying to agent engine...')
-    agent_config['entrypoint_module'] = adk_app
+    agent_config['entrypoint_module'] = f'{temp_folder}.{adk_app}'
     agent_config['entrypoint_object'] = 'adk_app'
-    agent_config['source_packages'] = [temp_folder[1:]]
+    agent_config['source_packages'] = [temp_folder]
     agent_config['class_methods'] = _AGENT_ENGINE_CLASS_METHODS
-    # agent_config['agent_framework'] = 'google-adk'
+    agent_config['agent_framework'] = 'google-adk'
 
     if not agent_engine_id:
-      client.agent_engines.create(config=agent_config)
+      agent_engine = client.agent_engines.create(config=agent_config)
+      click.secho(
+          f'✅ Created agent engine: {agent_engine.api_resource.name}',
+          fg='green',
+      )
     else:
       resource_name = f'projects/{project}/locations/{region}/reasoningEngines/{agent_engine_id}'
       client.agent_engines.update(name=resource_name, config=agent_config)
+      click.secho(f'✅ Updated agent engine: {resource_name}', fg='green')
   finally:
     click.echo(f'Cleaning up the temp folder: {temp_folder}')
     shutil.rmtree(temp_folder)
