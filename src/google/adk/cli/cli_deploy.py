@@ -82,7 +82,10 @@ if {express_mode}: # Whether or not to use Express Mode
   import vertexai
   vertexai.init(api_key=os.environ.get("GOOGLE_API_KEY"))
 
-adk_app = AdkApp({adk_app_type}={adk_app_object})
+adk_app = AdkApp(
+    {adk_app_type}={adk_app_object},
+    enable_tracing={trace_to_cloud_option},
+)
 """
 
 _AGENT_ENGINE_CLASS_METHODS = [
@@ -825,18 +828,8 @@ def to_agent_engine(
       else:
         env_vars['GOOGLE_GENAI_USE_VERTEXAI'] = '1'
         env_vars['GOOGLE_API_KEY'] = express_mode_api_key
-    elif os.environ.get('GOOGLE_GENAI_USE_VERTEXAI') and os.environ.get(
-        'GOOGLE_API_KEY'
-    ):
-      env_vars['GOOGLE_GENAI_USE_VERTEXAI'] = '1'
-      env_vars['GOOGLE_API_KEY'] = os.environ.get('GOOGLE_API_KEY')
-      click.echo(
-          'GOOGLE_GENAI_USE_VERTEXAI and GOOGLE_API_KEY are set in the'
-          ' environment. Using them for Express Mode.'
-      )
-    env_vars['GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY'] = (
-        'true' if trace_to_cloud else 'false'
-    )
+    if trace_to_cloud is False:
+      env_vars['GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY'] = 'false'
     if env_vars:
       if 'env_vars' in agent_config:
         click.echo(
@@ -897,10 +890,10 @@ def to_agent_engine(
     agent_config['entrypoint_module'] = f'{temp_folder}.{adk_app}'
     agent_config['entrypoint_object'] = 'adk_app'
     agent_config['source_packages'] = [temp_folder]
-    agent_config['class_methods'] = _AGENT_ENGINE_CLASS_METHODS
-    agent_config['agent_framework'] = 'google-adk'
 
     if not agent_engine_id:
+      agent_config['class_methods'] = _AGENT_ENGINE_CLASS_METHODS
+      agent_config['agent_framework'] = 'google-adk'
       agent_engine = client.agent_engines.create(config=agent_config)
       click.secho(
           f'✅ Created agent engine: {agent_engine.api_resource.name}',
